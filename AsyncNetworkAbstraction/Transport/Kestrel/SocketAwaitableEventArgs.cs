@@ -3,14 +3,11 @@
 
 #nullable enable
 
-using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Net.Sockets;
-using System.Runtime.ExceptionServices;
-using System.Threading;
 using System.Threading.Tasks.Sources;
 
-namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
+namespace Orleans.Networking.Transport;
 
 // A slimmed down version of https://github.com/dotnet/runtime/blob/82ca681cbac89d813a3ce397e0c665e6c051ed67/src/libraries/System.Net.Sockets/src/System/Net/Sockets/Socket.Tasks.cs#L798 that
 // 1. Doesn't support any custom scheduling other than the PipeScheduler (no sync context, no task scheduler)

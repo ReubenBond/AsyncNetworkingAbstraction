@@ -3,11 +3,9 @@
 
 #nullable enable
 
-using System;
 using System.Net.Sockets;
-using System.Threading.Tasks;
 
-namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
+namespace Orleans.Networking.Transport;
 
 internal sealed class SocketReceiver : SocketAwaitableEventArgs
 {

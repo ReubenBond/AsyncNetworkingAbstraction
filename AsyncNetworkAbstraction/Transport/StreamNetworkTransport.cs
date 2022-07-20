@@ -1,42 +1,41 @@
 #nullable enable
 
-using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Orleans.Networking.Transport;
 
-internal class StreamNetworkTransport : NetworkTransport
+internal abstract class StreamNetworkTransport : NetworkTransport
 {
     private readonly ILogger _logger;
-    private readonly Stream _stream;
-    private readonly Action _onReadProgress;
-    private readonly Action _signalWriteLoop;
     private readonly SingleWaiterInlineSignal _writerSignal = new();
+    private readonly SingleWaiterInlineSignal _readerSignal = new();
     private readonly Queue<WriteRequest> _pendingWrites = new();
-    private readonly Task _processWritesTask;
+    private readonly Queue<ReadRequest> _pendingReads = new();
+    private Task? _runTask;
     private readonly CancellationTokenSource _connectionClosingCts = new();
     private readonly CancellationTokenSource _connectionClosedCts = new();
-    private Memory<byte> _readRequestBuffer;
-    private ReadRequest? _readRequest;
-    private ValueTaskAwaiter<int> _outstandingReadAsync;
+    private readonly object _writesLock = new();
+    private readonly object _readsLock = new();
+    private Exception? _shutdownReason;
 
-    public StreamNetworkTransport(Stream stream, ILogger logger)
+    protected StreamNetworkTransport(ILogger logger)
     {
         _logger = logger;
-        _stream = stream;
-        _onReadProgress = OnReadProgress;
-        _signalWriteLoop = _writerSignal.Signal;
-
-        {
-            using var _ = new ExecutionContextSuppressor();
-            _processWritesTask = Task.Run(ProcessWrites);
-        }
     }
 
-    public override CancellationToken Closed => throw new NotImplementedException();
+    protected abstract Stream Stream { get; }
+
+    public virtual void Start()
+    {
+        _runTask = RunAsync();
+    }
+
+    public override CancellationToken Closed => _connectionClosedCts.Token;
 
     public override async ValueTask CloseAsync(Exception? closeException)
     {
+        _shutdownReason ??= closeException;
         _connectionClosingCts.Cancel();
 
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -45,12 +44,15 @@ internal class StreamNetworkTransport : NetworkTransport
 
         static void OnClosed(object? state)
         {
-            if (state is not TaskCompletionSource completion) throw new ArgumentException(nameof(state));
+            if (state is not TaskCompletionSource completion) throw new ArgumentException($"State must be a {nameof(TaskCompletionSource)}", nameof(state));
             completion.TrySetResult();
         }
     }
 
-    public override ValueTask DisposeAsync() => throw new NotImplementedException();
+    public override async ValueTask DisposeAsync()
+    {
+        await CloseAsync(null);
+    }
 
     public override bool ReadAsync(ReadRequest request)
     {
@@ -59,10 +61,12 @@ internal class StreamNetworkTransport : NetworkTransport
             return false;
         }
 
-        _readRequest = request;
-        _readRequestBuffer = _readRequest.Buffer;
-        _outstandingReadAsync = _stream.ReadAsync(request.Buffer).GetAwaiter();
-        _outstandingReadAsync.OnCompleted(_onReadProgress);
+        lock (_readsLock)
+        {
+            _pendingReads.Enqueue(request);
+        }
+
+        _readerSignal.Signal();
         return true;
     }
 
@@ -73,85 +77,138 @@ internal class StreamNetworkTransport : NetworkTransport
             return false;
         }
 
-        _pendingWrites.Enqueue(request);
+        lock (_writesLock)
+        {
+            _pendingWrites.Enqueue(request);
+        }
+
         _writerSignal.Signal();
         return true;
     }
 
-    private void OnReadProgress()
+    private async Task RunAsync()
     {
-        var bytesRead = _outstandingReadAsync.GetResult();
-        bool completed;
-        if (bytesRead == 0)
+        try
         {
-            _readRequest!.OnError(new EndOfStreamException());
-            _connectionClosingCts.Cancel();
-            completed = true;
+            await RunAsyncCore();
         }
-        else if (_readRequest!.OnProgress(bytesRead))
+        finally
         {
-            completed = true;
-        }
-        else
-        {
-            completed = false;
-        }
-
-        if (completed)
-        {
-            ResetReadRequest();
-        }
-        else
-        {
-            _readRequestBuffer = _readRequestBuffer.Slice(bytesRead);
-            _outstandingReadAsync = _stream.ReadAsync(_readRequest.Buffer).GetAwaiter();
-            _outstandingReadAsync.OnCompleted(_onReadProgress);
-        }
-
-        void ResetReadRequest()
-        {
-            _readRequest = default;
-            _readRequestBuffer = default;
-            _outstandingReadAsync = default;
+            await DisposeAsync();
+            _connectionClosedCts.Cancel();
         }
     }
 
-    private async Task ProcessWrites()
+    protected virtual async Task RunAsyncCore()
     {
+        try
+        {
+            var readsTask = ProcessReads();
+            var writesTask = ProcessWrites();
+            await readsTask;
+            await writesTask;
+        }
+        catch (Exception exception)
+        {
+            _shutdownReason ??= exception;
+        }
+    }
+
+    private async Task ProcessReads()
+    {
+        await Task.Yield();
         Exception? error = default;
+        ReadRequest? operation = default;
         try
         {
             while (!_connectionClosingCts.IsCancellationRequested)
             {
-                while (_pendingWrites.TryDequeue(out var operation))
+                while (TryDequeue(out operation))
                 {
-                    try
+                    while (true)
                     {
-                        if (operation.IsSingleBuffer)
+                        var bytesRead = await Stream.ReadAsync(operation.Buffer);
+                        if (bytesRead == 0)
                         {
-                            await _stream.WriteAsync(operation.Buffer);
-                        }
-                        else
-                        {
-                            foreach (var buffer in operation.Buffers)
-                            {
-                                await _stream.WriteAsync(buffer);
-                            }
+                            error = new EndOfStreamException();
+                            break;
                         }
 
-                        operation.OnCompleted();
+                        if (operation.OnProgress(bytesRead))
+                        {
+                            break;
+                        }
                     }
-                    catch (Exception exception)
+
+                    if (error is not null)
                     {
-                        error = exception;
-                        operation.OnError(exception);
+                        // Bubble the error up
                         break;
                     }
                 }
 
                 if (error is not null)
                 {
+                    // Bubble the error up
                     break;
+                }
+
+                await _readerSignal.WaitAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            error ??= exception;
+        }
+        finally
+        {
+            _shutdownReason ??= error;
+            if ((error ?? _shutdownReason) is { } reason)
+            {
+                operation?.OnError(reason);
+            }
+
+            if (error is not null)
+            {
+                _logger.LogError(0, error, $"Unexpected exception in {nameof(StreamNetworkTransport)}.{nameof(ProcessReads)}.");
+            }
+
+            _connectionClosingCts.Cancel();
+        }
+
+        bool TryDequeue([NotNullWhen(true)] out ReadRequest? operation)
+        {
+            lock (_readsLock)
+            {
+                return _pendingReads.TryDequeue(out operation);
+            }
+        }
+    }
+
+    private async Task ProcessWrites()
+    {
+        await Task.Yield();
+        Exception? error = default;
+        WriteRequest? operation = default;
+        try
+        {
+            while (!_connectionClosingCts.IsCancellationRequested)
+            {
+                while (TryDequeue(out operation))
+                {
+                    if (operation.IsSingleBuffer)
+                    {
+                        await Stream.WriteAsync(operation.Buffer);
+                    }
+                    else
+                    {
+                        foreach (var buffer in operation.Buffers)
+                        {
+                            await Stream.WriteAsync(buffer);
+                        }
+                    }
+
+                    operation.OnCompleted();
                 }
 
                 await _writerSignal.WaitAsync();
@@ -159,18 +216,30 @@ internal class StreamNetworkTransport : NetworkTransport
         }
         catch (Exception exception)
         {
-            error = exception;
+            error ??= exception;
         }
         finally
         {
+            _shutdownReason ??= error;
+            if ((error ?? _shutdownReason) is { } reason)
+            {
+                operation?.OnError(reason);
+            }
+
             if (error is not null)
             {
                 _logger.LogError(0, error, $"Unexpected exception in {nameof(StreamNetworkTransport)}.{nameof(ProcessWrites)}.");
             }
 
             _connectionClosingCts.Cancel();
+        }
 
-            _connectionClosedCts.Cancel();
+        bool TryDequeue([NotNullWhen(true)] out WriteRequest? operation)
+        {
+            lock (_writesLock)
+            {
+                return _pendingWrites.TryDequeue(out operation);
+            }
         }
     }
 }

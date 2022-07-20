@@ -1,12 +1,8 @@
 #nullable enable
 
-using System;
-using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
 using Microsoft.Extensions.Logging;
 
 namespace Orleans.Networking.Transport;
@@ -31,6 +27,8 @@ internal sealed class TcpNetworkTransport : NetworkTransport
     private readonly CancellationTokenSource _connectionClosingCts = new();
     private readonly CancellationTokenSource _connectionClosedCts = new();
     private readonly object _shutdownLock = new object();
+    private readonly object _writesLock = new();
+    private readonly object _readsLock = new();
     private Task? _processingTask;
     private volatile bool _socketDisposed;
     private volatile Exception? _shutdownReason;
@@ -134,7 +132,11 @@ internal sealed class TcpNetworkTransport : NetworkTransport
             return false;
         }
 
-        _readRequests.Enqueue(request);
+        lock (_readsLock)
+        {
+            _readRequests.Enqueue(request);
+        }
+
         _readSignal.Signal();
         return true;
     }
@@ -146,7 +148,11 @@ internal sealed class TcpNetworkTransport : NetworkTransport
             return false;
         }
 
-        _writeRequests.Enqueue(request);
+        lock (_writesLock)
+        {
+            _writeRequests.Enqueue(request);
+        }
+
         _writeSignal.Signal();
         return true;
     }
@@ -195,23 +201,12 @@ internal sealed class TcpNetworkTransport : NetworkTransport
             while (!_connectionClosingCts.IsCancellationRequested)
             {
                 // Handle each request.
-                while (_readRequests.TryDequeue(out request))
+                while (TryDequeue(out request))
                 {
                     // Process the request to completion.
-                    Console.WriteLine($"Dequeued {request}");
                     while (true)
                     {
-                        Console.WriteLine($"Receiving into {request}");
                         await _socketReceiver.ReceiveAsync(_socket, request.Buffer);
-                        Console.WriteLine($"Received into {request}");
-                        /*
-                        // Wait until the result completes or the operation is canceled
-                        if (!_socketReceiver.IsCompleted)
-                        {
-                            await resultTask;
-                            _connectionClosingCts.Token.ThrowIfCancellationRequested();
-                        }
-                        */
 
                         if (_socketReceiver.HasError)
                         {
@@ -254,15 +249,14 @@ internal sealed class TcpNetworkTransport : NetworkTransport
                         {
                             // FIN
                             SocketsLog.ConnectionReadFin(_logger, this);
+                            error = new ConnectionAbortedException("Connection terminated normally");
+                            break;
                         }
 
                         if (request.OnProgress(transfered))
                         {
-                            Console.WriteLine($"Done with {request} after transfering {transfered}");
                             break;
                         }
-
-                        Console.WriteLine($"not done with {request} after transfering {transfered}");
                     }
 
                     if (error is not null)
@@ -305,6 +299,14 @@ internal sealed class TcpNetworkTransport : NetworkTransport
             _shutdownReason ??= error;
             _connectionClosingCts.Cancel();
         }
+
+        bool TryDequeue([NotNullWhen(true)] out ReadRequest? request)
+        {
+            lock (_readsLock)
+            {
+                return _readRequests.TryDequeue(out request);
+            }
+        }
     }
 
     private async Task ProcessWrites()
@@ -318,9 +320,16 @@ internal sealed class TcpNetworkTransport : NetworkTransport
             while (!_connectionClosingCts.IsCancellationRequested)
             {
                 // Handle each request.
-                while (_writeRequests.TryDequeue(out request))
+                while (TryDequeue(out request))
                 {
-                    await _socketSender.SendAsync(_socket, request.Buffers);
+                    if (request.IsSingleBuffer)
+                    {
+                        await _socketSender.SendAsync(_socket, request.Buffer);
+                    }
+                    else
+                    {
+                        await _socketSender.SendAsync(_socket, request.Buffers);
+                    }
 
                     if (_socketSender.HasError)
                     {
@@ -403,6 +412,14 @@ internal sealed class TcpNetworkTransport : NetworkTransport
 
             _shutdownReason ??= error;
             _connectionClosingCts.Cancel();
+        }
+
+        bool TryDequeue([NotNullWhen(true)] out WriteRequest? request)
+        {
+            lock (_writesLock)
+            {
+                return _writeRequests.TryDequeue(out request);
+            }
         }
     }
 

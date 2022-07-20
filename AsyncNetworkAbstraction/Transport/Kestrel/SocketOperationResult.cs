@@ -6,7 +6,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Net.Sockets;
 
-namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
+namespace Orleans.Networking.Transport;
 
 internal readonly struct SocketOperationResult
 {

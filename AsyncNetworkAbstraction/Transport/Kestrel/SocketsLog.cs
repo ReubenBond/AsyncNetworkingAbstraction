@@ -3,11 +3,9 @@
 
 #nullable enable
 
-using System;
 using Microsoft.Extensions.Logging;
-using Orleans.Networking.Transport;
 
-namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
+namespace Orleans.Networking.Transport;
 
 internal static partial class SocketsLog
 {

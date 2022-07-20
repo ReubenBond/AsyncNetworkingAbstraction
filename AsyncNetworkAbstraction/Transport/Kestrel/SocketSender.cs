@@ -3,15 +3,12 @@
 
 #nullable enable
 
-using System;
 using System.Buffers;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Threading.Tasks;
 
-namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
+namespace Orleans.Networking.Transport;
 
 internal sealed class SocketSender : SocketAwaitableEventArgs
 {
@@ -55,7 +52,7 @@ internal sealed class SocketSender : SocketAwaitableEventArgs
         }
     }
 
-    private ValueTask SendAsync(Socket socket, ReadOnlyMemory<byte> memory)
+    public ValueTask SendAsync(Socket socket, ReadOnlyMemory<byte> memory)
     {
         SetBuffer(MemoryMarshal.AsMemory(memory));
 

@@ -33,7 +33,7 @@ public abstract class WriteRequest
     public abstract void OnError(Exception error);
 }
 
-internal abstract class NetworkTransport : IAsyncDisposable
+public abstract class NetworkTransport : IAsyncDisposable
 {
     public abstract bool ReadAsync(ReadRequest request);
     public abstract bool WriteAsync(WriteRequest request);

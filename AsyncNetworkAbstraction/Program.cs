@@ -1,26 +1,52 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Orleans.Connections.Security;
+using Orleans.Connections.Security.Tests;
 using Orleans.Networking.Transport;
 using Orleans.Serialization.Buffers.Adaptors;
-using System.ComponentModel.DataAnnotations;
+using System.Buffers;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace AsyncNetworkAbstraction
 {
     internal class Program
     {
-        public ILogger? Logger { get; private set; }
+        private readonly ILogger _logger;
+        private readonly X509Certificate2 _certificate;
+        private readonly TlsOptions _tlsOptions;
 
         static async Task Main(string[] args)
         {
             Console.WriteLine("Hello, World!");
-            var prog = new Program();
-            await prog.RunAsync(args);
+            
+            await new Program().RunAsync(args);
             //await prog.MessageParsing();
+        }
+
+        public Program()
+        {
+            var serviceCollection = new ServiceCollection();
+            serviceCollection.AddLogging(logging => logging.AddConsole());
+            var services = serviceCollection.BuildServiceProvider();
+            _logger = services.GetRequiredService<ILogger<Program>>();
+
+            _certificate = TestCertificateHelper.CreateSelfSignedCertificate("foo", new string[] { TestCertificateHelper.ClientAuthenticationOid, TestCertificateHelper.ServerAuthenticationOid });
+            _tlsOptions = new TlsOptions()
+            {
+                LocalCertificate = _certificate,
+                OnAuthenticateAsClient = (NetworkTransport transport, TlsClientAuthenticationOptions options) =>
+                {
+                    options.TargetHost = "foo";
+                },
+                OnAuthenticateAsServer = (NetworkTransport transport, TlsServerAuthenticationOptions options) =>
+                {
+                },
+            };
+            _tlsOptions.AllowAnyRemoteCertificate();
         }
 
         public async Task MessageParsing()
@@ -72,8 +98,14 @@ namespace AsyncNetworkAbstraction
 
         public async Task RunAsync(string[] args)
         {
-            var host = new HostBuilder().ConfigureServices(services => services.AddLogging(logging => logging.AddConsole())).Build();
-            Logger = host.Services.GetRequiredService<ILogger<Program>>();
+            /*
+            var pipe = new Pipe();
+
+            var logger = services.GetRequiredService<ILogger<StreamNetworkTransport>>();
+            var pipeWriterTransport = new StreamNetworkTransport(pipe.Writer.AsStream(), logger);
+            var pipeReaderTransport = new StreamNetworkTransport(pipe.Reader.AsStream(), logger);
+            await Task.WhenAll(ProcessSends(pipeWriterTransport), ProcessReceives(pipeReaderTransport));
+            */
 
             var endpoint = new IPEndPoint(IPAddress.Loopback, 8885);
             var server = RunServer(endpoint);
@@ -128,7 +160,7 @@ namespace AsyncNetworkAbstraction
 
                 await readRequest.Completed;
                 var result = ParseMessage(readRequest);
-                Logger!.LogInformation("Client read result: \"{Message}\" (excess bytes: {Excess})", result, readRequest.UnconsumedLength);
+                _logger!.LogInformation("Client read result: \"{Message}\" (excess bytes: {Excess})", result, readRequest.UnconsumedLength);
 
                 if (readRequest.UnconsumedLength > 0)
                 {
@@ -140,14 +172,14 @@ namespace AsyncNetworkAbstraction
                     var needsMoreData = !readRequest.TryParseMessage();
                     if (!needsMoreData)
                     {
-                        Logger!.LogInformation("Next message is already ready (\"{Message}\"), previous req was {previous}", ParseMessage(readRequest), previous);
+                        _logger!.LogInformation("Next message is already ready (\"{Message}\"), previous req was {previous}", ParseMessage(readRequest), previous);
                     }
                 }
                 else
                 {
                     Console.WriteLine($"Resetting {readRequest}");
                     readRequest.Reset();
-                    Logger!.LogInformation("Next message is not ready");
+                    _logger!.LogInformation("Next message is not ready");
                 }
 
                 ++count;
@@ -187,7 +219,7 @@ namespace AsyncNetworkAbstraction
                 await readRequest.Completed;
                 var message = ParseMessage(readRequest);
 
-                Logger!.LogInformation("Server read request: \"{Message}\" ({Excess} bytes excess)", message, readRequest.UnconsumedLength);
+                _logger!.LogInformation("Server read request: \"{Message}\" ({Excess} bytes excess)", message, readRequest.UnconsumedLength);
                 if (readRequest.UnconsumedLength > 0)
                 {
                 //var entireBuffer = Encoding.UTF8.GetString(readRequest.Unconsumed.ToArray());
@@ -201,17 +233,17 @@ namespace AsyncNetworkAbstraction
                     var needsMoreData = !readRequest.TryParseMessage();
                     if (!needsMoreData)
                     {
-                        Logger!.LogInformation("Next message is already ready (\"{Message}\"), {Previous}", ParseMessage(readRequest), previous);
+                        _logger!.LogInformation("Next message is already ready (\"{Message}\"), {Previous}", ParseMessage(readRequest), previous);
                     }
                 }
                 else
                 {
                     readRequest.Reset();
-                    Logger!.LogInformation("Next message is not ready");
+                    _logger!.LogInformation("Next message is not ready");
                 }
 
                 writeRequest.Set($"Echo: {message}");
-                Logger!.LogInformation("Server responding with: {Message}", message);
+                _logger!.LogInformation("Server responding with: {Message}", message);
                 var canWrite = client.WriteAsync(writeRequest);
                 Debug.Assert(canWrite);
                 await writeRequest.Completed;
@@ -261,11 +293,13 @@ namespace AsyncNetworkAbstraction
                     var acceptSocket = await listenSocket.AcceptAsync();
                     acceptSocket.NoDelay = true;
 
-                    var connection = new TcpNetworkTransport(acceptSocket, Logger!);
+                    var transport = new TcpNetworkTransport(acceptSocket, _logger!);
+                    transport.Start();
 
-                    connection.Start();
+                    var secureTransport = new ServerTlsNetworkTransport(transport, _tlsOptions, _logger);
+                    secureTransport.Start();
 
-                    return connection;
+                    return secureTransport;
                 }
                 catch (ObjectDisposedException)
                 {
@@ -294,7 +328,7 @@ namespace AsyncNetworkAbstraction
                 NoDelay = true
             };
 
-            //socket.EnableFastPath();
+            socket.EnableFastPath();
             using var completion = new SingleUseSocketAsyncEventArgs
             {
                 RemoteEndPoint = endpoint
@@ -315,9 +349,13 @@ namespace AsyncNetworkAbstraction
                 throw new SocketConnectionException($"Unable to connect to {endpoint}. Error: {completion.SocketError}");
             }
 
-            var connection = new TcpNetworkTransport(socket, Logger!);
-            connection.Start();
-            return connection;
+            var transport = new TcpNetworkTransport(socket, _logger!);
+            transport.Start();
+
+            var secureTransport = new ClientTlsNetworkTransport(transport, _tlsOptions, _logger);
+            secureTransport.Start();
+
+            return secureTransport;
         }
 
         private sealed class SingleUseSocketAsyncEventArgs : SocketAsyncEventArgs

@@ -3,10 +3,8 @@
 
 #nullable enable
 
-using System;
-using System.Threading;
 
-namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets.Internal;
+namespace Orleans.Networking.Transport;
 
 internal static class CorrelationIdGenerator
 {
