@@ -1,5 +1,5 @@
-﻿using Orleans.Networking.Transport;
-using Orleans.Serialization.Buffers.Adaptors;
+﻿using Orleans.Networking;
+using Orleans.Networking.Buffers;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
@@ -23,7 +23,6 @@ public sealed class MessageWriteRequest : WriteRequest, IValueTaskSource, IDispo
     {
         var payloadSize = Encoding.UTF8.GetByteCount(message);
         var totalSize = sizeof(int) + payloadSize;
-        Console.WriteLine($"{this} WSize = {totalSize}");
         var span = _buffer.GetSpan(totalSize);
         BinaryPrimitives.WriteInt32LittleEndian(span, payloadSize);
         var written = Encoding.UTF8.GetBytes(message, span[sizeof(int)..]);

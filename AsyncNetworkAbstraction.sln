@@ -3,7 +3,9 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.3.32708.82
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncNetworkAbstraction", "AsyncNetworkAbstraction\AsyncNetworkAbstraction.csproj", "{99C5D9FB-D140-4269-970E-267F47C44BD1}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "AsyncNetworkAbstraction", "AsyncNetworkAbstraction\AsyncNetworkAbstraction.csproj", "{99C5D9FB-D140-4269-970E-267F47C44BD1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Orleans.Networking", "Orleans.Networking\Orleans.Networking.csproj", "{7D4FF9BB-41C7-4A6F-8A32-1DC7F3DD8E79}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +17,10 @@ Global
 		{99C5D9FB-D140-4269-970E-267F47C44BD1}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{99C5D9FB-D140-4269-970E-267F47C44BD1}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{99C5D9FB-D140-4269-970E-267F47C44BD1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7D4FF9BB-41C7-4A6F-8A32-1DC7F3DD8E79}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7D4FF9BB-41C7-4A6F-8A32-1DC7F3DD8E79}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7D4FF9BB-41C7-4A6F-8A32-1DC7F3DD8E79}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7D4FF9BB-41C7-4A6F-8A32-1DC7F3DD8E79}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
