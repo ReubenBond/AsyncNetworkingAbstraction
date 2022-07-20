@@ -188,18 +188,22 @@ internal sealed class TcpNetworkTransport : NetworkTransport
     {
         await Task.Yield();
         Exception? error = null;
+        ReadRequest? request = null;
         try
         {
             // Loop until termination.
             while (!_connectionClosingCts.IsCancellationRequested)
             {
                 // Handle each request.
-                while (_readRequests.TryDequeue(out var request))
+                while (_readRequests.TryDequeue(out request))
                 {
                     // Process the request to completion.
+                    Console.WriteLine($"Dequeued {request}");
                     while (true)
                     {
+                        Console.WriteLine($"Receiving into {request}");
                         await _socketReceiver.ReceiveAsync(_socket, request.Buffer);
+                        Console.WriteLine($"Received into {request}");
                         /*
                         // Wait until the result completes or the operation is canceled
                         if (!_socketReceiver.IsCompleted)
@@ -254,8 +258,11 @@ internal sealed class TcpNetworkTransport : NetworkTransport
 
                         if (request.OnProgress(transfered))
                         {
+                            Console.WriteLine($"Done with {request} after transfering {transfered}");
                             break;
                         }
+
+                        Console.WriteLine($"not done with {request} after transfering {transfered}");
                     }
 
                     if (error is not null)
@@ -293,6 +300,8 @@ internal sealed class TcpNetworkTransport : NetworkTransport
         }
         finally
         {
+            if (error is { }) request?.OnError(error);
+
             _shutdownReason ??= error;
             _connectionClosingCts.Cancel();
         }
@@ -302,23 +311,16 @@ internal sealed class TcpNetworkTransport : NetworkTransport
     {
         await Task.Yield();
         Exception? error = null;
+        WriteRequest? request = null;
         try
         {
             // Loop until termination.
             while (!_connectionClosingCts.IsCancellationRequested)
             {
                 // Handle each request.
-                while (_writeRequests.TryDequeue(out var request))
+                while (_writeRequests.TryDequeue(out request))
                 {
-                    var resultTask = _socketSender.SendAsync(_socket, request.Buffers);
-
-                    // Wait until the result completes or the operation is canceled
-                    if (!_socketSender.IsCompleted)
-                    {
-                        resultTask.GetAwaiter().UnsafeOnCompleted(_fireWriteSignal);
-                        await _writeSignal.WaitAsync();
-                        _connectionClosingCts.Token.ThrowIfCancellationRequested();
-                    }
+                    await _socketSender.SendAsync(_socket, request.Buffers);
 
                     if (_socketSender.HasError)
                     {
@@ -394,6 +396,11 @@ internal sealed class TcpNetworkTransport : NetworkTransport
         }
         finally
         {
+            if (error is { })
+            {
+                request?.OnError(error);
+            }
+
             _shutdownReason ??= error;
             _connectionClosingCts.Cancel();
         }

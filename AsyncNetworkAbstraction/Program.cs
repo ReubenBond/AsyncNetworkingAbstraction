@@ -3,9 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Orleans.Networking.Transport;
 using Orleans.Serialization.Buffers.Adaptors;
-using System.Buffers;
-using System.Buffers.Binary;
-using System.Buffers.Text;
+using System.ComponentModel.DataAnnotations;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -22,6 +20,54 @@ namespace AsyncNetworkAbstraction
             Console.WriteLine("Hello, World!");
             var prog = new Program();
             await prog.RunAsync(args);
+            //await prog.MessageParsing();
+        }
+
+        public async Task MessageParsing()
+        {
+            var readRequest = new MessageReadRequest();
+            var writeRequest = new MessageWriteRequest();
+            var pipe = new PooledBuffer();
+            while (true)
+            {
+                for (var i = 0; i < 100; i++)
+                {
+                    writeRequest.Set(Guid.NewGuid().ToString("N"));
+                    var buffers = writeRequest.Buffers;
+                    foreach (var seg in buffers)
+                    {
+                        pipe.Write(seg.Span);
+                    }
+                    writeRequest.OnCompleted();
+                    await writeRequest.Completed;
+                    writeRequest.Reset();
+                }
+
+                readRequest.SetBuffer(pipe);
+                while (readRequest.TryParseMessage())
+                {
+                    await readRequest.Completed;
+
+                    var msg = ParseMessage(readRequest);
+                    Console.WriteLine(msg);
+
+                    if (readRequest.UnconsumedLength > 0)
+                    {
+                        var excess = new PooledBuffer();
+                        var unconsumed = readRequest.Unconsumed;
+                        unconsumed.CopyTo(ref excess);
+                        readRequest.Reset();
+                        readRequest.SetBuffer(excess);
+                    }
+                    else
+                    {
+                        readRequest.Reset();
+                    }
+                }
+
+                pipe.Reset();
+            }
+
         }
 
         public async Task RunAsync(string[] args)
@@ -36,143 +82,83 @@ namespace AsyncNetworkAbstraction
             await client;
         }
 
-
-        public sealed class MessageWriteRequest : WriteRequest
-        {
-            TaskCompletionSource _completion = new();
-            ReadOnlyMemory<byte> _buffer;
-            public MessageWriteRequest(string message)
-            {
-                var count = Encoding.UTF8.GetByteCount(message);
-                var bytes = new byte[count + sizeof(int)];
-                BinaryPrimitives.WriteInt32LittleEndian(bytes, (int)count);
-                var written = Encoding.UTF8.GetBytes(message, bytes.AsSpan(sizeof(int)));
-                Debug.Assert(written == count);
-
-                _buffer = bytes;
-            }
-
-            public override ReadOnlyMemory<byte> Buffer => _buffer;
-
-            public override ReadOnlySequence<byte> Buffers => new(_buffer);
-
-            public Task Completed => _completion.Task;
-
-            public override void OnCompleted()
-            {
-                _completion.TrySetResult();
-            }
-
-            public override void OnError(Exception error)
-            {
-                _completion.TrySetException(error);
-            }
-        }
-
-        public sealed class MessageReadRequest2 : ReadRequest, IDisposable
-        {
-            TaskCompletionSource<string> _completion = new();
-            private PooledArrayBufferWriter _buffer = new();
-            private int _messageLength;
-
-            public Task<string> Completed => _completion.Task;
-            public override Memory<byte> Buffer => _buffer.GetMemory();
-
-            public int FramedLength => sizeof(int) + _messageLength;
-            public int UnconsumedLength => _buffer.Length - FramedLength;
-
-            public void Dispose() => _buffer.Dispose();
-
-            public override void OnError(Exception error)
-            {
-                _completion.SetException(error);
-            }
-
-            public override bool OnProgress(int bytesRead)
-            {
-                _buffer.Advance(bytesRead);
-                if (_buffer.Length < sizeof(int))
-                {
-                    return false;
-                }
-
-                if (_messageLength < 0)
-                {
-                    Span<byte> lengthBytes = stackalloc byte[sizeof(int)];
-                    _buffer.CopyTo(lengthBytes);
-                    _messageLength = BinaryPrimitives.ReadInt32LittleEndian(lengthBytes);
-                }
-
-                if (_buffer.Length < FramedLength)
-                {
-                    return false;
-                }
-
-                var payloadSpan = _buffer.ToArray().AsSpan(sizeof(int));
-                var result = Encoding.UTF8.GetString(payloadSpan);
-                _completion.SetResult(result);
-                return true;
-            }
-        }
-
-        public sealed class MessageReadRequest : ReadRequest
-        {
-            TaskCompletionSource<string> _completion = new();
-            private byte[] _buffer = new byte[4096];
-            private int _length = -1;
-            private int _totalRead;
-
-            public Task<string> Completed => _completion.Task;
-            public override Memory<byte> Buffer => _buffer.AsMemory(_totalRead);
-
-            public override void OnError(Exception error)
-            {
-                _completion.SetException(error);
-            }
-
-            public override bool OnProgress(int bytesRead)
-            {
-                _totalRead += bytesRead;
-                if (_totalRead < sizeof(int))
-                {
-                    return false;
-                }
-
-                if (_length < 0)
-                {
-                    _length = BinaryPrimitives.ReadInt32LittleEndian(_buffer.AsSpan(0, sizeof(int)));
-                }
-
-                if (_totalRead < _length)
-                {
-                    return false;
-                }
-
-                var result = Encoding.UTF8.GetString(_buffer.AsSpan(sizeof(int), _length));
-                _completion.SetResult(result);
-                return true;
-            }
-        }
-
         public async Task RunClient(EndPoint endpoint)
         {
             var server = await ConnectAsync(endpoint, CancellationToken.None);
 
+            var processSendsTask = ProcessSends(server);
+            var processReceivesTask = ProcessReceives(server);
+
+            await processSendsTask;
+            await processReceivesTask;
+        }
+
+        private async Task ProcessSends(NetworkTransport server)
+        {
+            await Task.Yield();
             var count = 0;
+            using var writeRequest = new MessageWriteRequest();
             while (true)
             {
-                var message = $"Hello, World! {count}";
-                var writeRequest = new MessageWriteRequest(message);
-                using var readRequest = new MessageReadRequest2();
+                var message = Guid.NewGuid().ToString("N");
+                writeRequest.Set(message);
                 var canWrite = server.WriteAsync(writeRequest);
                 Debug.Assert(canWrite);
-                var canRead = server.ReadAsync(readRequest);
-                Debug.Assert(canRead);
                 await writeRequest.Completed;
-                var result = await readRequest.Completed;
-                Logger!.LogInformation("Client read result: {Result}", result);
+                //Logger!.LogInformation("Wrote Message #{Count}", count);
+                if (count % 10 == 0) await Task.Delay(10);
+                await Task.Yield();
+                writeRequest.Reset();
                 ++count;
             }
+        }
+
+        private async Task ProcessReceives(NetworkTransport server)
+        {
+            var count = 0;
+            var readRequest = new MessageReadRequest();
+            var excessBuffer = new PooledBuffer();
+            while (true)
+            {
+                if (!readRequest.Completed.IsCompleted)
+                {
+                    var canRead = server.ReadAsync(readRequest);
+                    Debug.Assert(canRead);
+                }
+
+                await readRequest.Completed;
+                var result = ParseMessage(readRequest);
+                Logger!.LogInformation("Client read result: \"{Message}\" (excess bytes: {Excess})", result, readRequest.UnconsumedLength);
+
+                if (readRequest.UnconsumedLength > 0)
+                {
+                    excessBuffer = new();
+                    readRequest.Unconsumed.CopyTo(ref excessBuffer);
+                    var previous = readRequest;
+                    readRequest.Reset();
+                    readRequest.SetBuffer(excessBuffer);
+                    var needsMoreData = !readRequest.TryParseMessage();
+                    if (!needsMoreData)
+                    {
+                        Logger!.LogInformation("Next message is already ready (\"{Message}\"), previous req was {previous}", ParseMessage(readRequest), previous);
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Resetting {readRequest}");
+                    readRequest.Reset();
+                    Logger!.LogInformation("Next message is not ready");
+                }
+
+                ++count;
+            }
+        }
+
+        private string ParseMessage(MessageReadRequest request)
+        {
+            var slice = request.Payload;
+            var payloadSpan = slice.ToArray().AsSpan();
+            return Encoding.UTF8.GetString(payloadSpan);
         }
 
         public async Task RunServer(EndPoint endpoint)
@@ -188,17 +174,48 @@ namespace AsyncNetworkAbstraction
 
         public async Task ServeClient(NetworkTransport client)
         {
+            var readRequest = new MessageReadRequest();
+            using var writeRequest = new MessageWriteRequest();
             while (true)
             {
-                using var readRequest = new MessageReadRequest2();
-                var canRead = client.ReadAsync(readRequest);
-                Debug.Assert(canRead);
-                var message = await readRequest.Completed;
-                Logger!.LogInformation("Server read request: {Message}", message);
-                var writeRequest = new MessageWriteRequest($"Echo: {message}");
+                if (!readRequest.Completed.IsCompleted)
+                {
+                    var canRead = client.ReadAsync(readRequest);
+                    Debug.Assert(canRead);
+                }
+
+                await readRequest.Completed;
+                var message = ParseMessage(readRequest);
+
+                Logger!.LogInformation("Server read request: \"{Message}\" ({Excess} bytes excess)", message, readRequest.UnconsumedLength);
+                if (readRequest.UnconsumedLength > 0)
+                {
+                //var entireBuffer = Encoding.UTF8.GetString(readRequest.Unconsumed.ToArray());
+                    var excessBuffer = new PooledBuffer();
+                    readRequest.Unconsumed.CopyTo(ref excessBuffer);
+                    var previous = readRequest;
+                    readRequest.Reset();
+                    readRequest.SetBuffer(excessBuffer);
+
+                    //excessBuffer.Dispose();
+                    var needsMoreData = !readRequest.TryParseMessage();
+                    if (!needsMoreData)
+                    {
+                        Logger!.LogInformation("Next message is already ready (\"{Message}\"), {Previous}", ParseMessage(readRequest), previous);
+                    }
+                }
+                else
+                {
+                    readRequest.Reset();
+                    Logger!.LogInformation("Next message is not ready");
+                }
+
+                writeRequest.Set($"Echo: {message}");
+                Logger!.LogInformation("Server responding with: {Message}", message);
                 var canWrite = client.WriteAsync(writeRequest);
                 Debug.Assert(canWrite);
                 await writeRequest.Completed;
+                writeRequest.Reset();
             }
         }
 
