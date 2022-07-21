@@ -27,7 +27,7 @@ public sealed class TcpNetworkTransport : NetworkTransport
     private readonly string _connectionId;
     private readonly CancellationTokenSource _connectionClosingCts = new();
     private readonly CancellationTokenSource _connectionClosedCts = new();
-    private readonly object _shutdownLock = new object();
+    private readonly object _shutdownLock = new();
     private readonly object _writesLock = new();
     private readonly object _readsLock = new();
     private Task? _processingTask;

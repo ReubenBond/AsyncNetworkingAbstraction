@@ -281,21 +281,32 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
             Length = length;
         }
 
-        //public readonly ref PooledBuffer Buffer => ref _writer;
-
         public readonly int Length { get; init; }
 
         /// <summary>Copies the contents of this writer to a span.</summary>
-        public readonly void CopyTo(Span<byte> output)
+        public readonly int CopyTo(Span<byte> output)
         {
+            int copied = 0;
             foreach (var span in this)
             {
                 span.CopyTo(output);
                 output = output[span.Length..];
+                copied += span.Length;
+            }
+
+            return copied;
+        }
+
+        /// <summary>Copies the contents of this writer to a pooled buffer.</summary>
+        public readonly void CopyTo(ref PooledBuffer output)
+        {
+            foreach (var span in this)
+            {
+                output.Write(span);
             }
         }
 
-        /// <summary>Copies the contents of this writer to a span.</summary>
+        /// <summary>Copies the contents of this writer to a buffer writer.</summary>
         public readonly void CopyTo<TBufferWriter>(ref TBufferWriter output) where TBufferWriter : struct, IBufferWriter<byte>
         {
             foreach (var span in this)
@@ -366,20 +377,20 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
         }
         */
 
-        public readonly SpanEnumerator GetEnumerator() => new(this);
+        public readonly SpanEnumerator GetEnumerator() => new(in this);
 
         public readonly ref struct MemorySequence
         {
             private readonly ref BufferSlice _slice;
             public MemorySequence(in BufferSlice slice) => _slice = slice;
-            public MemoryEnumerator GetEnumerator() => new(_slice);
+            public MemoryEnumerator GetEnumerator() => new(in _slice);
         }
 
         public readonly ref struct SpanSequence
         {
             private readonly ref BufferSlice _slice;
             public SpanSequence(in BufferSlice slice) => _slice = slice;
-            public SpanEnumerator GetEnumerator() => new(_slice);
+            public SpanEnumerator GetEnumerator() => new(in _slice);
         }
 
         public ref struct SpanEnumerator
@@ -390,7 +401,7 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
             private int _position;
             private SequenceSegment? _segment;
 
-            public SpanEnumerator(BufferSlice slice)
+            public SpanEnumerator(in BufferSlice slice)
             {
                 _slice = slice;
                 _segment = InitialSegmentSentinel;
@@ -457,9 +468,9 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
 
         public ref struct MemoryEnumerator
         {
-            private static readonly SequenceSegment InitialSegmentSentinel = new SequenceSegment();
-            private static readonly SequenceSegment FinalSegmentSentinel = new SequenceSegment();
-            private readonly ref BufferSlice _slice;
+            private static readonly SequenceSegment InitialSegmentSentinel = new();
+            private static readonly SequenceSegment FinalSegmentSentinel = new();
+            private readonly BufferSlice _slice;
             private int _position;
             private SequenceSegment? _segment;
 
@@ -550,7 +561,7 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
             }
             else if (_largeBlocks.TryDequeue(out block))
             {
-                block.InitializeLargeSegment(size);
+                block.ResizeLargeSegment(size);
                 return block;
             }
 
@@ -559,7 +570,8 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
 
         internal void Return(SequenceSegment block)
         {
-            if (block.IsStandardSize)
+            Debug.Assert(block.IsValid);
+            if (block.IsMinimumSize)
             {
                 _blocks.Enqueue(block);
             }
@@ -579,25 +591,42 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
 
         internal SequenceSegment(int length)
         {
-            InitializeSegment(length);
+            InitializeArray(length);
         }
 
-        public void InitializeLargeSegment(int length)
+        public void ResizeLargeSegment(int length)
         {
-            InitializeSegment((int)BitOperations.RoundUpToPowerOf2((uint)length));
+            Debug.Assert(length > SequenceSegmentPool.MinimumBlockSize);
+            InitializeArray(length);
         }
 
         [MemberNotNull(nameof(Array))]
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void InitializeSegment(int length)
+        private void InitializeArray(int length)
         {
             if (length <= SequenceSegmentPool.MinimumBlockSize)
             {
+                Debug.Assert(Array is null);
                 var pinnedArray = GC.AllocateUninitializedArray<byte>(SequenceSegmentPool.MinimumBlockSize, pinned: true);
                 Array = pinnedArray;
             }
             else
             {
+                // Round up to a power of two.
+                length = (int)BitOperations.RoundUpToPowerOf2((uint)length);
+
+                if (Array is not null)
+                {
+                    // The segment has an appropriate size already.
+                    if (Array.Length == length)
+                    {
+                        return;
+                    }
+
+                    // The segment is being resized.
+                    ArrayPool<byte>.Shared.Return(Array);
+                }
+
                 Array = ArrayPool<byte>.Shared.Rent(length);
             }
         }
@@ -606,13 +635,14 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
 
         public ReadOnlyMemory<byte> CommittedMemory => Memory;
 
-        public bool IsStandardSize => Array.Length == SequenceSegmentPool.MinimumBlockSize;
+        public bool IsValid => Array is { Length: > 0 };
+        public bool IsMinimumSize => Array.Length == SequenceSegmentPool.MinimumBlockSize;
 
         public Memory<byte> AsMemory(int offset) => AsMemory(offset, Array.Length - offset);
 
         public Memory<byte> AsMemory(int offset, int length)
         {
-            if (IsStandardSize)
+            if (IsMinimumSize)
             {
                 return MemoryMarshal.CreateFromPinnedArray(Array, offset, length);
             }
@@ -634,15 +664,7 @@ public struct PooledBuffer : IBufferWriter<byte>, IDisposable
             Next = default;
             Memory = default;
 
-            if (IsStandardSize)
-            {
-                SequenceSegmentPool.Shared.Return(this);
-            }
-            else if (Array.Length > 0)
-            {
-                ArrayPool<byte>.Shared.Return(Array);
-                Array = System.Array.Empty<byte>();
-            }
+            SequenceSegmentPool.Shared.Return(this);
         }
     }
 }
